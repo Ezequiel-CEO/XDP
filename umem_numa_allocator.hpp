@@ -41,7 +41,6 @@
 #include "hornet_config.hpp"
 
 #include <atomic>
-#include <bit>
 #include <cassert>
 #include <cerrno>
 #include <cstdint>
@@ -116,13 +115,6 @@ public:
     [[nodiscard]] bool initialize(size_t frame_size, size_t num_frames) noexcept {
         if (nodes_) return true;  // já inicializado
 
-        if (frame_size == 0 || (frame_size & (frame_size - 1)) != 0 ||
-            num_frames == 0 || num_frames > UINT32_MAX ||
-            num_frames > SIZE_MAX / sizeof(FrameNode)) {
-            std::fprintf(stderr, "[FRAME_POOL] configuração inválida\n");
-            return false;
-        }
-
         frame_size_ = frame_size;
         num_frames_ = num_frames;
 
@@ -149,7 +141,7 @@ public:
 
         // Topo da stack = índice 0 (frame offset 0)
         StackHead initial{ 0, 0 };
-        head_.store(std::bit_cast<uint64_t>(initial), std::memory_order_release);
+        head_.store(*reinterpret_cast<uint64_t*>(&initial), std::memory_order_release);
 
         total_frames_.store(static_cast<uint32_t>(num_frames), std::memory_order_relaxed);
         free_count_.store(static_cast<uint32_t>(num_frames), std::memory_order_relaxed);
@@ -180,12 +172,12 @@ public:
     [[nodiscard]] uint64_t pop() noexcept {
         uint64_t raw = head_.load(std::memory_order_acquire);
         while (true) {
-            const StackHead head = std::bit_cast<StackHead>(raw);
+            StackHead head = *reinterpret_cast<StackHead*>(&raw);
             if (head.idx == NULL_IDX) return UINT64_MAX;  // Pool vazio
 
             const uint32_t next = nodes_[head.idx].next_idx;
             StackHead new_head{ next, head.seq + 1 };  // seq++ previne ABA
-            const uint64_t new_raw = std::bit_cast<uint64_t>(new_head);
+            uint64_t new_raw = *reinterpret_cast<uint64_t*>(&new_head);
 
             if (head_.compare_exchange_weak(raw, new_raw,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -199,22 +191,17 @@ public:
     // ── Push: devolve um frame ao pool após processamento ────────────────────
     // umem_offset: offset do frame a devolver (múltiplo de frame_size)
     void push(uint64_t umem_offset) noexcept {
-        if (!nodes_ || frame_size_ == 0 || umem_offset % frame_size_ != 0 ||
-            umem_offset / frame_size_ >= num_frames_) {
-            invalid_pushes_.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
         // Encontra o índice do nó via divisão (O(1) — frame_size é potência de 2)
         const uint32_t idx = static_cast<uint32_t>(umem_offset / frame_size_);
         nodes_[idx].umem_offset = umem_offset;
 
         uint64_t raw = head_.load(std::memory_order_acquire);
         while (true) {
-            const StackHead head = std::bit_cast<StackHead>(raw);
+            StackHead head = *reinterpret_cast<StackHead*>(&raw);
             nodes_[idx].next_idx = head.idx;  // novo nó aponta para topo atual
 
-            StackHead new_head{ idx, head.seq };  // every ABA cycle also contains a pop
-            const uint64_t new_raw = std::bit_cast<uint64_t>(new_head);
+            StackHead new_head{ idx, head.seq };  // push não incrementa seq (só pop)
+            uint64_t new_raw = *reinterpret_cast<uint64_t*>(&new_head);
 
             if (head_.compare_exchange_weak(raw, new_raw,
                     std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -252,9 +239,6 @@ public:
 
     [[nodiscard]] uint32_t free_count()  const noexcept { return free_count_.load(std::memory_order_relaxed); }
     [[nodiscard]] uint32_t total_frames() const noexcept { return total_frames_.load(std::memory_order_relaxed); }
-    [[nodiscard]] uint64_t invalid_pushes() const noexcept {
-        return invalid_pushes_.load(std::memory_order_relaxed);
-    }
     [[nodiscard]] bool     is_empty()    const noexcept { return free_count() == 0; }
     [[nodiscard]] bool     is_full()     const noexcept { return free_count() == total_frames(); }
 
@@ -268,7 +252,6 @@ private:
     alignas(64) std::atomic<uint64_t> head_{};  // Treiber stack head (seq|idx)
     alignas(64) std::atomic<uint32_t> free_count_{0};
     alignas(64) std::atomic<uint32_t> total_frames_{0};
-    alignas(64) std::atomic<uint64_t> invalid_pushes_{0};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,12 +274,6 @@ public:
             int     numa_node   = -1) noexcept {
 
         if (base_ != nullptr) return true;
-
-        if (frame_size == 0 || (frame_size & (frame_size - 1)) != 0 ||
-            num_frames == 0 || num_frames > SIZE_MAX / frame_size) {
-            std::fprintf(stderr, "[UMEM] FATAL: configuração de frames inválida.\n");
-            return false;
-        }
 
         frame_size_ = frame_size;
         num_frames_ = num_frames;
@@ -361,29 +338,13 @@ public:
     [[nodiscard]] bool          is_valid()    const noexcept { return initialized_; }
     [[nodiscard]] HugePageTier  tier()        const noexcept { return tier_;        }
 
-    [[nodiscard]] bool valid_range(uint64_t umem_offset,
-                                   size_t length) const noexcept {
-        return base_ && umem_offset <= total_size_ &&
-               length <= total_size_ - static_cast<size_t>(umem_offset);
-    }
-
-    [[nodiscard]] bool valid_frame_range(uint64_t umem_offset,
-                                         size_t length) const noexcept {
-        if (!valid_range(umem_offset, length) || frame_size_ == 0) return false;
-        const size_t within_frame = static_cast<size_t>(umem_offset) &
-                                    (frame_size_ - 1);
-        return length <= frame_size_ - within_frame;
-    }
-
     // Converte UMEM offset → ponteiro (para leitura do payload)
     [[nodiscard]] void* frame_ptr(uint64_t umem_offset) const noexcept {
-        if (!valid_range(umem_offset, 1)) return nullptr;
         return static_cast<uint8_t*>(base_) + umem_offset;
     }
 
     // Ponteiro para o payload do frame (pula o headroom)
     [[nodiscard]] void* payload_ptr(uint64_t umem_offset) const noexcept {
-        if (!valid_range(umem_offset, UMEM_HEADROOM + 1)) return nullptr;
         return static_cast<uint8_t*>(base_) + umem_offset + UMEM_HEADROOM;
     }
 
@@ -427,7 +388,7 @@ private:
         FILE* f = std::fopen(path, "r");
         if (!f) return 0;
         int node = 0;
-        if (std::fscanf(f, "%d", &node) != 1) node = 0;
+        std::fscanf(f, "%d", &node);
         std::fclose(f);
         return node;
     }

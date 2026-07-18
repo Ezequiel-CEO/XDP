@@ -21,7 +21,7 @@
 // LAYOUT DE MEMÓRIA:
 //   Cada array é alignas(64) — começa em cache line boundary
 //   Capacity = 64K slots = 65536 ticks
-//   Tamanho total ≈ 65536 × (8+8+8+8+8+8+4+8+2+1+1) bytes ≈ 4.2MB
+//   Tamanho total ≈ 65536 × (8+4+4+4+4+8+4+4+2+1+1) bytes ≈ 2.6MB
 //   Cabe confortavelmente em LLC (8-32MB em CPUs modernas)
 //
 // SPSC LOCK-FREE:
@@ -36,7 +36,6 @@
 
 #include "hornet_config.hpp"
 #include <atomic>
-#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>  // _mm_pause, _mm_sfence
@@ -49,26 +48,26 @@ namespace hornet {
 // ─────────────────────────────────────────────────────────────────────────────
 struct MarketTickView {
     uint64_t timestamp_ns;   // TSC ou exchange timestamp (nanosegundos)
-    uint64_t price_open;     // Scaled × 1e8 (fixed-point exato)
-    uint64_t price_high;
-    uint64_t price_low;
-    uint64_t price_close;
+    uint32_t price_open;     // Scaled × 1e-6 (int → elimina ponto flutuante no hot path)
+    uint32_t price_high;
+    uint32_t price_low;
+    uint32_t price_close;
     uint64_t volume;         // Volume em unidades base (scaled × 1e-8 para crypto)
     uint32_t asset_id;       // ID do ativo (hash comprimido do símbolo)
-    uint64_t sequence_num;   // Número de sequência do feed (para detecção de gaps)
+    uint32_t sequence_num;   // Número de sequência do feed (para detecção de gaps)
     uint16_t exchange_id;    // FeedSource enum comprimido
     uint8_t  flags;          // Bitmask: bit0=bid_ask_imbalance, bit1=large_print, etc.
     uint8_t  _pad;
 
     // Conversores inline (sem overhead — eliminados pelo compilador)
-    [[nodiscard]] inline double open()   const noexcept { return price_open   * 1e-8; }
-    [[nodiscard]] inline double high()   const noexcept { return price_high   * 1e-8; }
-    [[nodiscard]] inline double low()    const noexcept { return price_low    * 1e-8; }
-    [[nodiscard]] inline double close()  const noexcept { return price_close  * 1e-8; }
+    [[nodiscard]] inline double open()   const noexcept { return price_open   * 1e-6; }
+    [[nodiscard]] inline double high()   const noexcept { return price_high   * 1e-6; }
+    [[nodiscard]] inline double low()    const noexcept { return price_low    * 1e-6; }
+    [[nodiscard]] inline double close()  const noexcept { return price_close  * 1e-6; }
     [[nodiscard]] inline double vol()    const noexcept { return volume       * 1e-8; }
     [[nodiscard]] inline bool is_bullish() const noexcept { return price_close > price_open; }
     [[nodiscard]] inline bool is_bearish() const noexcept { return price_close < price_open; }
-    [[nodiscard]] inline uint64_t body() const noexcept {
+    [[nodiscard]] inline uint32_t body() const noexcept {
         return (price_close > price_open)
                ? price_close - price_open
                : price_open  - price_close;
@@ -92,13 +91,13 @@ public:
     // Ordem: campos acessados mais frequentemente primeiro
     // (SIMD engine processa prices em batch → ficam em L1/L2)
     alignas(64) uint64_t timestamps_ns [N];   // 64 × 64K = 512KB
-    alignas(64) uint64_t prices_close  [N];   // 512KB — mais acessado
-    alignas(64) uint64_t prices_open   [N];   // 512KB
-    alignas(64) uint64_t prices_high   [N];   // 512KB
-    alignas(64) uint64_t prices_low    [N];   // 512KB
+    alignas(64) uint32_t prices_close  [N];   // 32 × 64K = 256KB — mais acessado
+    alignas(64) uint32_t prices_open   [N];   // 256KB
+    alignas(64) uint32_t prices_high   [N];   // 256KB
+    alignas(64) uint32_t prices_low    [N];   // 256KB
     alignas(64) uint64_t volumes       [N];   // 512KB
     alignas(64) uint32_t asset_ids     [N];   // 256KB
-    alignas(64) uint64_t sequence_nums [N];   // 512KB
+    alignas(64) uint32_t sequence_nums [N];   // 256KB
     alignas(64) uint16_t exchange_ids  [N];   // 128KB
     alignas(64) uint8_t  flags_arr     [N];   // 64KB
     alignas(64) uint8_t  _pad_arr      [N];   // Alinhamento
@@ -153,8 +152,8 @@ public:
 
     // Versão de push com campos individuais (evita construção do MarketTickView)
     [[nodiscard]] inline bool push_raw(
-            uint64_t ts_ns, uint64_t open, uint64_t high, uint64_t low, uint64_t close,
-            uint64_t vol, uint32_t asset_id, uint64_t seq, uint16_t exchange_id,
+            uint64_t ts_ns, uint32_t open, uint32_t high, uint32_t low, uint32_t close,
+            uint64_t vol, uint32_t asset_id, uint32_t seq, uint16_t exchange_id,
             uint8_t flags) noexcept {
         const uint64_t h = head_cache_;
         const uint64_t t = tail_.load(std::memory_order_acquire);

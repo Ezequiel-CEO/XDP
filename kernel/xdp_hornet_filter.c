@@ -38,14 +38,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// UAPI linux/ip.h does not export these userspace aliases on every distro.
-#ifndef IP_MF
-#define IP_MF      0x2000
-#endif
-#ifndef IP_OFFMASK
-#define IP_OFFMASK 0x1FFF
-#endif
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuração runtime (carregada via BPF map pelo user space)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -112,11 +104,6 @@ static __always_inline int is_market_data_port(__be16 port, struct hornet_config
             p == cfg->itch_port_udp);
 }
 
-static __always_inline int is_essential_udp(__be16 port) {
-    __u16 p = bpf_ntohs(port);
-    return p == 53 || p == 67 || p == 68 || p == 123; // DNS, DHCP, NTP
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: processa pacote UDP e redireciona se for market data
 // Retorna XDP_REDIRECT se redirecionado, -1 se não é market data
@@ -135,10 +122,6 @@ static __always_inline int try_redirect_udp(struct xdp_md *ctx,
     // Verifica porta de destino ou origem (market data chega no destino)
     if (!is_market_data_port(udp->dest, cfg) &&
         !is_market_data_port(udp->source, cfg)) {
-        if (is_essential_udp(udp->dest) || is_essential_udp(udp->source)) {
-            stat_inc(STAT_PASSED);
-            return XDP_PASS;
-        }
         return -1;  // Não é market data
     }
 
@@ -203,11 +186,6 @@ int xdp_hornet_filter(struct xdp_md *ctx) {
             return XDP_DROP;
         }
 
-        if (iph->version != 4 || iph->ihl < 5) {
-            stat_inc(STAT_ERRORS);
-            return XDP_DROP;
-        }
-
         // Rejeita pacotes fragmentados — não são usados em feeds HFT
         if (iph->frag_off & bpf_htons(IP_MF | IP_OFFMASK)) {
             stat_inc(STAT_DROPPED);
@@ -215,10 +193,6 @@ int xdp_hornet_filter(struct xdp_md *ctx) {
         }
 
         void *transport = (void*)iph + (iph->ihl * 4);
-        if (transport > data_end) {
-            stat_inc(STAT_ERRORS);
-            return XDP_DROP;
-        }
 
         if (iph->protocol == IPPROTO_UDP) {
             int ret = try_redirect_udp(ctx, data, data_end, transport, cfg);
