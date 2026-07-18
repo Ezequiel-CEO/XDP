@@ -100,7 +100,7 @@ add_library(hornet_xdp STATIC
 target_include_directories(hornet_xdp
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/..         # Acesso aos módulos GhostMode/DFA
+        ${CMAKE_CURRENT_SOURCE_DIR}/..         # Acesso aos módulos Ghost_Mode/DFA
         ${LIBBPF_INCLUDE_DIRS}
         ${LIBXDP_INCLUDE_DIRS}
 )

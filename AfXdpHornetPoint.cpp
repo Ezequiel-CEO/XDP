@@ -5,6 +5,7 @@
 #include "AfXdpHornetPoint.hpp"
 
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>      // ★ Necessário para bpf_map_update_elem
 #include <bpf/xsk.h>
 #include <errno.h>
 #include <immintrin.h>    // _mm_pause
@@ -164,20 +165,21 @@ void AfXdpHornetPoint::initial_fill() noexcept {
     const uint32_t batch = XDP_FILL_RING_SIZE;
     uint32_t reserved = xsk_ring_prod__reserve(&fill_ring_, batch, &idx_fill);
 
+    uint32_t actually_filled = 0;
     for (uint32_t i = 0; i < reserved; ++i) {
         const uint64_t off = umem_->alloc_frame();
         if (off == UINT64_MAX) {
-            // Pool vazio (raro no início) — retorna slots não usados
-            xsk_ring_prod__cancel(&fill_ring_, reserved - i);
-            reserved = i;
+            // Pool vazio (raro no início) — não há cancel em APIs novas,
+            // apenas submetemos o que conseguimos.
             break;
         }
         *xsk_ring_prod__fill_addr(&fill_ring_, idx_fill++) = off;
+        actually_filled++;
     }
 
-    if (reserved > 0) {
-        xsk_ring_prod__submit(&fill_ring_, reserved);
-        std::printf("[HORNET] Fill ring inicial: %u frames\n", reserved);
+    if (actually_filled > 0) {
+        xsk_ring_prod__submit(&fill_ring_, actually_filled);
+        std::printf("[HORNET] Fill ring inicial: %u frames\n", actually_filled);
     }
 }
 
@@ -226,6 +228,8 @@ bool AfXdpHornetPoint::initialize(
 // ─────────────────────────────────────────────────────────────────────────────
 bool AfXdpHornetPoint::load_bpf_program(const std::string& bpf_obj_path,
                                           FilterMode filter_mode) noexcept {
+    if (bpf_obj_) return true;
+
     // Abre o objeto BPF
     struct bpf_object* obj = bpf_object__open(bpf_obj_path.c_str());
     if (!obj) {
@@ -239,6 +243,7 @@ bool AfXdpHornetPoint::load_bpf_program(const std::string& bpf_obj_path,
         std::fprintf(stderr, "[HORNET] bpf_object__load falhou: %s\n",
                      strerror(errno));
         bpf_object__close(obj);
+        prog_fd_ = -1;
         return false;
     }
 
@@ -247,31 +252,60 @@ bool AfXdpHornetPoint::load_bpf_program(const std::string& bpf_obj_path,
     if (!prog) {
         std::fprintf(stderr, "[HORNET] Programa 'xdp_hornet_filter' não encontrado no .o\n");
         bpf_object__close(obj);
+        prog_fd_ = -1;
         return false;
     }
     prog_fd_ = bpf_program__fd(prog);
+    if (prog_fd_ < 0) {
+        std::fprintf(stderr, "[HORNET] Programa XDP carregado sem file descriptor válido\n");
+        bpf_object__close(obj);
+        return false;
+    }
 
     // ── Configura config_map com as portas e modo ─────────────────────────────
     struct bpf_map* cfg_map = bpf_object__find_map_by_name(obj, "config_map");
-    if (cfg_map) {
-        hornet_bpf_config cfg{};
-        cfg.market_data_port_udp = MARKET_DATA_PORT_UDP;
-        cfg.fix_port_udp         = FIX_PORT_UDP;
-        cfg.itch_port_udp        = ITCH_PORT_UDP;
-        cfg.management_port_tcp  = MANAGEMENT_PORT_TCP;
-        cfg.mode                 = static_cast<uint8_t>(filter_mode);
-        cfg.enable_ipv6          = 0;
+    if (!cfg_map) {
+        std::fprintf(stderr, "[HORNET] config_map ausente no objeto eBPF\n");
+        bpf_object__close(obj);
+        prog_fd_ = -1;
+        return false;
+    }
+    hornet_bpf_config cfg{};
+    cfg.market_data_port_udp = MARKET_DATA_PORT_UDP;
+    cfg.fix_port_udp         = FIX_PORT_UDP;
+    cfg.itch_port_udp        = ITCH_PORT_UDP;
+    cfg.management_port_tcp  = MANAGEMENT_PORT_TCP;
+    cfg.mode                 = static_cast<uint8_t>(filter_mode);
+    cfg.enable_ipv6          = 0;
 
-        uint32_t key = 0;
-        bpf_map__update_elem(cfg_map, &key, sizeof(key), &cfg, sizeof(cfg), BPF_ANY);
+    uint32_t key = 0;
+    const int cfg_fd = bpf_map__fd(cfg_map);
+    if (cfg_fd < 0 || bpf_map_update_elem(cfg_fd, &key, &cfg, BPF_ANY) != 0) {
+        std::fprintf(stderr, "[HORNET] Falha ao configurar config_map: %s\n",
+                     strerror(errno));
+        bpf_object__close(obj);
+        prog_fd_ = -1;
+        return false;
     }
 
     // ── Registra socket no xsks_map ──────────────────────────────────────────
     struct bpf_map* xsks_map = bpf_object__find_map_by_name(obj, "xsks_map");
-    if (xsks_map && xsk_) {
-        int xsk_fd = xsk_socket__fd(xsk_);
-        uint32_t key = queue_id_;
-        bpf_map__update_elem(xsks_map, &key, sizeof(key), &xsk_fd, sizeof(xsk_fd), BPF_ANY);
+    if (!xsks_map || !xsk_) {
+        std::fprintf(stderr, "[HORNET] xsks_map ou socket AF_XDP ausente\n");
+        bpf_object__close(obj);
+        prog_fd_ = -1;
+        return false;
+    }
+    const int xsk_fd = xsk_socket__fd(xsk_);
+    key = queue_id_;
+    const int xsks_fd = bpf_map__fd(xsks_map);
+    if (xsk_fd < 0 || xsks_fd < 0 ||
+        bpf_map_update_elem(xsks_fd, &key, &xsk_fd, BPF_ANY) != 0) {
+        std::fprintf(stderr, "[HORNET] Falha ao registrar socket no xsks_map: %s\n",
+                     strerror(errno));
+        bpf_object__close(obj);
+        prog_fd_ = -1;
+        return false;
     }
 
     // ── Anexa o programa à interface (XDP native mode) ───────────────────────
@@ -279,25 +313,40 @@ bool AfXdpHornetPoint::load_bpf_program(const std::string& bpf_obj_path,
     if (ifindex == 0) {
         std::fprintf(stderr, "[HORNET] Interface '%s' não encontrada.\n", iface_.c_str());
         bpf_object__close(obj);
+        prog_fd_ = -1;
         return false;
     }
 
-    xdp_flags_ = XDP_FLAGS_DRV_MODE;  // Native/driver mode (mais rápido)
-    int ret = bpf_xdp_attach(ifindex, prog_fd_, xdp_flags_, nullptr);
-    if (ret != 0) {
+    xdp_flags_ = XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST;
+    int ret = bpf_set_link_xdp_fd(ifindex, prog_fd_, xdp_flags_);
+    if (ret != 0 && ret != -EEXIST) {
         // Fallback para SKB mode (funciona em qualquer NIC, inclusive virtual)
         std::fprintf(stderr,
             "[HORNET] Native XDP falhou (%s) — tentando SKB mode.\n",
             strerror(-ret));
-        xdp_flags_ = XDP_FLAGS_SKB_MODE;
-        ret = bpf_xdp_attach(ifindex, prog_fd_, xdp_flags_, nullptr);
+        xdp_flags_ = XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST;
+        ret = bpf_set_link_xdp_fd(ifindex, prog_fd_, xdp_flags_);
     }
 
     if (ret != 0) {
-        std::fprintf(stderr, "[HORNET] bpf_xdp_attach falhou: %s\n", strerror(-ret));
+        std::fprintf(stderr, "[HORNET] bpf_set_link_xdp_fd falhou: %s\n", strerror(-ret));
         bpf_object__close(obj);
+        prog_fd_ = -1;
         return false;
     }
+
+    struct bpf_prog_info info{};
+    uint32_t info_len = sizeof(info);
+    if (bpf_obj_get_info_by_fd(prog_fd_, &info, &info_len) != 0 || info.id == 0) {
+        std::fprintf(stderr, "[HORNET] Não foi possível identificar o programa anexado\n");
+        const uint32_t mode_flags = xdp_flags_ &
+            (XDP_FLAGS_DRV_MODE | XDP_FLAGS_SKB_MODE | XDP_FLAGS_HW_MODE);
+        (void)bpf_set_link_xdp_fd(ifindex, -1, mode_flags);
+        bpf_object__close(obj);
+        prog_fd_ = -1;
+        return false;
+    }
+    attached_prog_id_ = info.id;
 
     bpf_obj_ = obj;
     std::printf("[HORNET] eBPF carregado e anexado a '%s' (mode=%s, filter=%s)\n",
@@ -326,14 +375,11 @@ void AfXdpHornetPoint::refill_fill_ring() noexcept {
     for (uint32_t i = 0; i < reserved; ++i) {
         const uint64_t off = umem_->alloc_frame();
         if (off == UINT64_MAX) {
-            // Pool vazio — cancela o restante
+            // Pool vazio — não há cancel, submetemos o que temos
             if (i == 0) {
-                xsk_ring_prod__cancel(&fill_ring_, reserved);
                 stats_.pool_exhausted.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            xsk_ring_prod__cancel(&fill_ring_, reserved - i);
-            reserved - i;  // ajusta para submit parcial
             break;
         }
         *xsk_ring_prod__fill_addr(&fill_ring_, idx_fill + i) = off;
@@ -449,13 +495,23 @@ void AfXdpHornetPoint::shutdown() noexcept {
         umem_if_ = nullptr;
     }
 
-    // Desanexa programa XDP da interface
-    if (prog_fd_ >= 0 && !iface_.empty()) {
+    // Desanexa somente se o programa ainda for o que esta instância anexou.
+    if (prog_fd_ >= 0 && attached_prog_id_ != 0 && !iface_.empty()) {
         unsigned int ifindex = if_nametoindex(iface_.c_str());
         if (ifindex > 0) {
-            bpf_xdp_detach(ifindex, xdp_flags_, nullptr);
+            const uint32_t mode_flags = xdp_flags_ &
+                (XDP_FLAGS_DRV_MODE | XDP_FLAGS_SKB_MODE | XDP_FLAGS_HW_MODE);
+            uint32_t current_id = 0;
+            if (bpf_get_link_xdp_id(ifindex, &current_id, mode_flags) == 0 &&
+                current_id == attached_prog_id_) {
+                (void)bpf_set_link_xdp_fd(ifindex, -1, mode_flags);
+            } else if (current_id != 0) {
+                std::fprintf(stderr,
+                    "[HORNET] Programa XDP da interface mudou; não será desanexado\n");
+            }
         }
         prog_fd_ = -1;
+        attached_prog_id_ = 0;
     }
 
     if (bpf_obj_) {
