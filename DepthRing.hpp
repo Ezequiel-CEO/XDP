@@ -3,44 +3,47 @@
 #define HORNET_DEPTH_RING_HPP
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 🔥 HORNET DEPTH RING — Real L5 Order Book, Lock-Free Double Buffer
+// 🔥 HORNET DEPTH RING — Real L5 Order Book, Versioned Atomic Snapshot
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // MISSÃO:
-//   Expor os 5 níveis reais do book (bid+ask) para o hot-path via zero-copy.
+//   Expor os 5 níveis reais do book (bid+ask) ao hot-path por snapshot atômico.
 //   Substitui a interpolação geométrica da tick_to_orderbook() por dados reais
 //   provenientes do stream "btcusdt@depth5@100ms" da Binance.
 //
 // PADRÃO DE ACESSO (assimetria intencional):
 //   Writer: DepthFeedAdapter thread (~10Hz, não latency-critical)
-//   Reader: hot_path_thread         (~100kHz, latency-critical → ZERO custo)
+//   Reader: hot_path_thread         (~100kHz, latency-critical)
 //
-// DESIGN — Atomic Double-Buffer Flip (sem seqlock, sem spinloop):
+// DESIGN — Atomic Double-Buffer + version validation:
 //
-//   buf_[0]  ←─── slot inativo (writer pode escrever aqui com segurança)
-//   buf_[1]  ←─── slot ativo   (reader aponta aqui)
+//   slots_[0]  ←─── slot inativo
+//   slots_[1]  ←─── slot ativo
 //   active_  ←─── índice atômico (0 ou 1)
 //
-//   WRITE: writer → escreve em buf_[1 - active_] → fence → flip active_
-//   READ:  reader → load active_ (acquire) → &buf_[active_] → lê campos
+//   WRITE: versão ímpar → 22 stores atômicos → versão par → flip
+//   READ:  versão → 22 loads atômicos → confirma a mesma versão par
 //
-//   GARANTIA: reader SEMPRE lê de um slot completo (o writer só toca no
-//   slot inativo, nunca no slot que o reader está usando).
+//   GARANTIA: mesmo após dois flips rápidos, não há data race, torn-read ou
+//   ponteiro para um objeto comum enquanto ele está sendo sobrescrito.
 //
 //   LATÊNCIA:
-//     write(): 1 atomic store + 176B memcpy (~10ns) — não é hot path
-//     peek():  1 atomic load + deref pointer   (~2ns) — hot path crítico
+//     write(): 22 stores atômicos + flip — cold path (~10Hz)
+//     try_copy(): 22 loads atômicos, normalmente uma tentativa
 //
 // THREAD SAFETY:
 //   SPSC: 1 writer (DepthFeedAdapter) + N readers (hot_path apenas na prática)
 //   Readers entre si: OK — apenas leituras, sem modificação de estado
-//   Writer + Reader: garantido pelo double-buffer flip com fence release/acquire
+//   Writer + Reader: palavras atômicas + versão release/acquire
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#include <array>
 #include <atomic>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <immintrin.h>   // _mm_sfence
+#include <type_traits>
 
 namespace hornet {
 
@@ -67,7 +70,7 @@ static_assert(sizeof(DepthL5Snapshot) == 192, "DepthL5Snapshot deve ter 192 byte
 static_assert(alignof(DepthL5Snapshot) == 64, "DepthL5Snapshot deve ser alinhado em 64B");
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DepthRing — Singleton. Lock-free double-buffer flip. Zero-copy no hot-path.
+// DepthRing — Singleton. Lock-free double-buffer com snapshot consistente.
 // ─────────────────────────────────────────────────────────────────────────────
 class DepthRing {
 public:
@@ -78,16 +81,20 @@ public:
     //
     // NUNCA chamado do hot-path — latência irrelevante.
     void write(const DepthL5Snapshot& snap) noexcept {
-        // Slot inativo = o que NÃO está sendo lido agora
         const uint32_t cur    = active_.load(std::memory_order_relaxed);
         const uint32_t next   = cur ^ 1u;  // toggle: 0↔1
-
-        // Escreve no slot inativo (reader nunca toca aqui)
-        buf_[next] = snap;
-
-        // Release fence: garante que todos os stores acima sejam visíveis
-        // ANTES que o flip do active_ seja visto por outros threads.
-        // (equivalente a _mm_sfence() + atomic store release)
+        Slot& slot = slots_[next];
+        uint64_t previous = slot.version.load(std::memory_order_acquire);
+        // O contrato é SPSC. Um valor já ímpar prova violação por um segundo
+        // producer; o slot permanece indisponível e os readers falham fechados.
+        if ((previous & 1U) != 0) return;
+        if (!slot.version.compare_exchange_strong(
+                previous, previous + 1, std::memory_order_acq_rel,
+                std::memory_order_acquire)) return; // odd: write in progress
+        const FullWordArray words = std::bit_cast<FullWordArray>(snap);
+        for (size_t i = 0; i < kDataWordCount; ++i)
+            slot.words[i].store(words[i], std::memory_order_relaxed);
+        slot.version.fetch_add(1, std::memory_order_release); // even: complete
         active_.store(next, std::memory_order_release);
 
         // Marca como válido (uma vez) — após o primeiro write
@@ -98,32 +105,38 @@ public:
         writes_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // ── Consumer API HOT-PATH: zero-copy pointer (~2ns) ──────────────────────
+    // ── Consumer API HOT-PATH: snapshot estável compatível ───────────────────
     //
     // Retorna ponteiro para o snapshot ativo.
     // Retorna nullptr se nenhum snapshot foi recebido ainda (fallback para
     // interpolação geométrica em tick_to_orderbook).
     //
-    // ATENÇÃO: o ponteiro é válido até o próximo write() (100ms).
-    // No hot-path (ticks a cada ~100µs), o ponteiro é sempre válido.
+    // O ponteiro referencia uma cópia thread_local e permanece válido até o
+    // próximo peek() realizado pela mesma thread.
     [[nodiscard]] const DepthL5Snapshot* peek() const noexcept {
-        // Fast path: verifica validade com acquire para sincronizar com write()
-        if (__builtin_expect(!valid_.load(std::memory_order_acquire), 0)) {
-            return nullptr;
-        }
-        // Carrega o índice do slot ativo com acquire — sincroniza com o store
-        // release do write(). Garante que buf_[idx] está completamente escrito.
-        const uint32_t idx = active_.load(std::memory_order_acquire);
-        return &buf_[idx];
+        thread_local DepthL5Snapshot stable{};
+        return try_copy(stable) ? &stable : nullptr;
     }
 
-    // Versão com cópia para quando o caller precisa de snapshot estável
-    // (ex: cold-path que processa mais de 100ms → risco de stale ptr)
+    // API canônica: cópia atômica versionada, no máximo oito tentativas.
     [[nodiscard]] bool try_copy(DepthL5Snapshot& out) const noexcept {
-        const DepthL5Snapshot* p = peek();
-        if (!p) return false;
-        out = *p;
-        return true;
+        if (__builtin_expect(!valid_.load(std::memory_order_acquire), 0))
+            return false;
+        for (unsigned attempt = 0; attempt < 8; ++attempt) {
+            const uint32_t index = active_.load(std::memory_order_acquire);
+            const Slot& slot = slots_[index];
+            const uint64_t before = slot.version.load(std::memory_order_acquire);
+            if ((before & 1U) != 0) continue;
+            FullWordArray words{};
+            for (size_t i = 0; i < kDataWordCount; ++i)
+                words[i] = slot.words[i].load(std::memory_order_relaxed);
+            const uint64_t after = slot.version.load(std::memory_order_acquire);
+            if (before == after && (after & 1U) == 0) {
+                out = std::bit_cast<DepthL5Snapshot>(words);
+                return true;
+            }
+        }
+        return false;
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -160,9 +173,27 @@ public:
 private:
     DepthRing() = default;
 
+    static constexpr size_t kFullWordCount =
+        sizeof(DepthL5Snapshot) / sizeof(uint64_t);
+    static constexpr size_t kDataWordCount =
+        offsetof(DepthL5Snapshot, _pad) / sizeof(uint64_t);
+    using FullWordArray = std::array<uint64_t, kFullWordCount>;
+    static_assert(std::is_trivially_copyable_v<DepthL5Snapshot>);
+    static_assert(sizeof(FullWordArray) == sizeof(DepthL5Snapshot));
+    static_assert(offsetof(DepthL5Snapshot, _pad) % sizeof(uint64_t) == 0);
+    static_assert(std::atomic<uint64_t>::is_always_lock_free,
+                  "DepthRing requires lock-free 64-bit atomics");
+
+    struct alignas(64) Slot {
+        std::atomic<uint64_t> version{0};
+        std::array<std::atomic<uint64_t>, kDataWordCount> words{};
+    };
+    static_assert(sizeof(Slot) == 192,
+                  "DepthRing slot must fit exactly three cache lines");
+
     // ── Estado ────────────────────────────────────────────────────────────────
     // Dois slots completos — writer usa o inativo, reader usa o ativo
-    alignas(64) DepthL5Snapshot buf_[2];
+    alignas(64) Slot slots_[2];
 
     // Índice do slot ativo (0 ou 1). Leitura acquire = sincroniza com write release.
     alignas(64) std::atomic<uint32_t> active_{0};

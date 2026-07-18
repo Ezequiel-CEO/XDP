@@ -62,7 +62,7 @@
 namespace hornet {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HornetBinaryTick — Formato proprietário de tick de mercado (40 bytes)
+// HornetBinaryTick V1 — formato legado de 40 bytes (preço ×1e6/uint32)
 //
 // Enviado pelo nosso feed server (ou gate de normalização de exchange).
 // Magic bytes permitem identificação rápida antes do parsing completo.
@@ -91,7 +91,25 @@ struct __attribute__((packed)) HornetBinaryTick {
 };
 static_assert(sizeof(HornetBinaryTick) == 40, "HornetBinaryTick deve ter 40 bytes");
 
-inline constexpr uint16_t HORNET_TICK_MAGIC    = 0xC3BE;
+// V2 removes the V1 price ceiling and preserves native exchange sequence IDs.
+// All numeric fields are network byte order; decimal fields use exact ×1e8.
+struct __attribute__((packed)) HornetBinaryTickV2 {
+    uint16_t magic;          // 0xC3BF
+    uint16_t asset_id;
+    uint64_t sequence_num;
+    uint64_t timestamp_ns;
+    uint64_t price_open;
+    uint64_t price_high;
+    uint64_t price_low;
+    uint64_t price_close;
+    uint64_t volume;
+};
+static_assert(sizeof(HornetBinaryTickV2) == 60,
+              "HornetBinaryTickV2 deve ter 60 bytes");
+
+inline constexpr uint16_t HORNET_TICK_MAGIC_V1 = 0xC3BE;
+inline constexpr uint16_t HORNET_TICK_MAGIC_V2 = 0xC3BF;
+inline constexpr uint16_t HORNET_TICK_MAGIC    = HORNET_TICK_MAGIC_V1;
 inline constexpr size_t   MIN_PAYLOAD_SIZE     = sizeof(HornetBinaryTick);
 inline constexpr size_t   ETH_IP_UDP_HDRLEN    = sizeof(ether_header)    // 14
                                                + sizeof(struct iphdr)     // 20 (min, sem options)
@@ -144,20 +162,39 @@ public:
     [[nodiscard]] bool ingest(UmemT& umem, const RxFrameInfo& frame) noexcept {
         stats_.frames_ingested.fetch_add(1, std::memory_order_relaxed);
 
-        // Validação mínima de tamanho
-        const size_t min_frame = ETH_IP_UDP_HDRLEN + MIN_PAYLOAD_SIZE;
-        if (__builtin_expect(frame.len < min_frame, 0)) {
+        // Validate every length before deriving a pointer from untrusted bytes.
+        constexpr size_t min_headers = sizeof(ether_header) +
+                                       sizeof(struct iphdr) +
+                                       sizeof(struct udphdr);
+        if (__builtin_expect(frame.options != 0 || frame.len < min_headers ||
+                             frame.len > UMEM_FRAME_SIZE, 0)) {
             stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
             return false;
+        }
+        if constexpr (requires {
+            umem.valid_frame_range(frame.umem_offset,
+                                   static_cast<size_t>(frame.len));
+        }) {
+            if (__builtin_expect(
+                    !umem.valid_frame_range(
+                        frame.umem_offset, static_cast<size_t>(frame.len)), 0)) {
+                stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
         }
 
         // Ponteiro para início do frame no UMEM
         const uint8_t* raw = static_cast<const uint8_t*>(
             umem.frame_ptr(frame.umem_offset));
+        if (__builtin_expect(raw == nullptr, 0)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
 
         // ── Parse Ethernet header ─────────────────────────────────────────────
-        const ether_header* eth = reinterpret_cast<const ether_header*>(raw);
-        const uint16_t eth_proto = ntohs(eth->ether_type);
+        ether_header eth{};
+        std::memcpy(&eth, raw, sizeof(eth));
+        const uint16_t eth_proto = ntohs(eth.ether_type);
 
         // Apenas IPv4 no hot path (IPv6 é tratado como unknown)
         if (__builtin_expect(eth_proto != ETHERTYPE_IP, 0)) {
@@ -166,23 +203,46 @@ public:
         }
 
         // ── Parse IPv4 header ─────────────────────────────────────────────────
-        const struct iphdr* iph = reinterpret_cast<const struct iphdr*>(
-            raw + sizeof(ether_header));
+        struct iphdr iph{};
+        std::memcpy(&iph, raw + sizeof(ether_header), sizeof(iph));
 
-        if (__builtin_expect(iph->protocol != IPPROTO_UDP, 0)) {
+        if (__builtin_expect(iph.version != 4 || iph.protocol != IPPROTO_UDP, 0)) {
             stats_.frames_unknown_proto.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
-        const size_t ip_hdr_len = static_cast<size_t>(iph->ihl) * 4;
+        const size_t ip_hdr_len = static_cast<size_t>(iph.ihl) * 4;
+        const size_t bytes_after_eth = frame.len - sizeof(ether_header);
+        if (__builtin_expect(iph.ihl < 5 || ip_hdr_len > bytes_after_eth ||
+                             bytes_after_eth - ip_hdr_len < sizeof(struct udphdr), 0)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        const size_t ip_total_len = ntohs(iph.tot_len);
+        const uint16_t fragment = ntohs(iph.frag_off);
+        if (__builtin_expect(ip_total_len < ip_hdr_len + sizeof(struct udphdr) ||
+                             ip_total_len > bytes_after_eth ||
+                             (fragment & 0x3FFFu) != 0, 0)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
 
         // ── Parse UDP header ──────────────────────────────────────────────────
-        const struct udphdr* udp = reinterpret_cast<const struct udphdr*>(
-            raw + sizeof(ether_header) + ip_hdr_len);
+        struct udphdr udp{};
+        std::memcpy(&udp, raw + sizeof(ether_header) + ip_hdr_len, sizeof(udp));
+
+        const size_t udp_len = ntohs(udp.len);
+        if (__builtin_expect(udp_len < sizeof(struct udphdr) ||
+                             udp_len != ip_total_len - ip_hdr_len ||
+                             sizeof(ether_header) + ip_hdr_len + udp_len > frame.len, 0)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
 
         // Payload começa após UDP header
-        const uint8_t* payload = reinterpret_cast<const uint8_t*>(udp + 1);
-        const size_t   payload_len = ntohs(udp->len) - sizeof(struct udphdr);
+        const uint8_t* payload = raw + sizeof(ether_header) + ip_hdr_len +
+                                 sizeof(struct udphdr);
+        const size_t payload_len = udp_len - sizeof(struct udphdr);
 
         if (__builtin_expect(payload_len < MIN_PAYLOAD_SIZE, 0)) {
             stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
@@ -196,8 +256,11 @@ public:
         std::memcpy(&magic, payload, sizeof(magic));
         magic = ntohs(magic);
 
-        if (__builtin_expect(magic == HORNET_TICK_MAGIC, 1)) {
-            return parse_hornet_tick(payload, payload_len, ntohs(udp->dest));
+        if (__builtin_expect(magic == HORNET_TICK_MAGIC_V2, 1)) {
+            return parse_hornet_tick_v2(payload, payload_len, ntohs(udp.dest));
+        }
+        if (magic == HORNET_TICK_MAGIC_V1) {
+            return parse_hornet_tick_v1(payload, payload_len, ntohs(udp.dest));
         }
 
         // Protocolo desconhecido — extensível aqui (ITCH 5.0, OUCH, MDP 3.0, etc.)
@@ -220,10 +283,13 @@ public:
 
 private:
     // ── Parser: HornetBinaryTick (formato proprietário 40 bytes) ─────────────
-    [[nodiscard]] bool parse_hornet_tick(const uint8_t* payload,
-                                          size_t         payload_len,
-                                          uint16_t       dest_port) noexcept {
-        if (payload_len < sizeof(HornetBinaryTick)) return false;
+    [[nodiscard]] bool parse_hornet_tick_v1(const uint8_t* payload,
+                                             size_t payload_len,
+                                             uint16_t dest_port) noexcept {
+        if (payload_len != sizeof(HornetBinaryTick)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
 
         // Load direto do payload — unaligned read (packed struct)
         HornetBinaryTick tick;
@@ -233,14 +299,50 @@ private:
         const uint16_t asset_id     = ntohs(tick.asset_id);
         const uint32_t seq_num      = ntohl(tick.sequence_num);
         const uint64_t ts_ns        = be64toh(tick.timestamp_ns);
-        const uint32_t price_open   = ntohl(tick.price_open);
-        const uint32_t price_high   = ntohl(tick.price_high);
-        const uint32_t price_low    = ntohl(tick.price_low);
-        const uint32_t price_close  = ntohl(tick.price_close);
+        // Exact scale conversion: V1 ×1e6 -> canonical ×1e8.
+        const uint64_t price_open   = static_cast<uint64_t>(ntohl(tick.price_open)) * 100ULL;
+        const uint64_t price_high   = static_cast<uint64_t>(ntohl(tick.price_high)) * 100ULL;
+        const uint64_t price_low    = static_cast<uint64_t>(ntohl(tick.price_low)) * 100ULL;
+        const uint64_t price_close  = static_cast<uint64_t>(ntohl(tick.price_close)) * 100ULL;
         const uint64_t volume       = be64toh(tick.volume);
 
+        return publish_tick(asset_id, seq_num, ts_ns, price_open, price_high,
+                            price_low, price_close, volume, dest_port);
+    }
+
+    [[nodiscard]] bool parse_hornet_tick_v2(const uint8_t* payload,
+                                             size_t payload_len,
+                                             uint16_t dest_port) noexcept {
+        if (payload_len != sizeof(HornetBinaryTickV2)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        HornetBinaryTickV2 tick{};
+        std::memcpy(&tick, payload, sizeof(tick));
+
+        return publish_tick(
+            ntohs(tick.asset_id), be64toh(tick.sequence_num),
+            be64toh(tick.timestamp_ns), be64toh(tick.price_open),
+            be64toh(tick.price_high), be64toh(tick.price_low),
+            be64toh(tick.price_close), be64toh(tick.volume), dest_port);
+    }
+
+    [[nodiscard]] bool publish_tick(uint16_t asset_id, uint64_t seq_num,
+                                    uint64_t ts_ns, uint64_t price_open,
+                                    uint64_t price_high, uint64_t price_low,
+                                    uint64_t price_close, uint64_t volume,
+                                    uint16_t dest_port) noexcept {
+        if (__builtin_expect(asset_id > 0xFFu || seq_num == 0 || ts_ns == 0 ||
+                             price_open == 0 || price_high == 0 || price_low == 0 ||
+                             price_close == 0 ||
+                             price_high < price_open || price_high < price_close ||
+                             price_low > price_open || price_low > price_close, 0)) {
+            stats_.frames_invalid.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
         // ── Detecção de gap de sequência ──────────────────────────────────────
-        const uint32_t last_seq = last_sequence_[asset_id & 0xFF];
+        const uint64_t last_seq = last_sequence_[asset_id & 0xFF];
         if (__builtin_expect(last_seq != 0 && seq_num != last_seq + 1, 0)) {
             stats_.sequence_gaps.fetch_add(1, std::memory_order_relaxed);
             // Não retorna false — o tick é válido mesmo com gap
@@ -270,10 +372,10 @@ private:
     // ─────────────────────────────────────────────────────────────────────────
     // Estado mínimo: último sequence por asset (256 assets, ring por asset_id & 0xFF)
     // Stack-allocated, zero heap.
-    // 256 × 4 bytes = 1KB — cabe em L1
+    // 256 × 8 bytes = 2KB — cabe em L1
     // ─────────────────────────────────────────────────────────────────────────
     DefaultSoaRing&           soa_ring_;
-    alignas(64) uint32_t      last_sequence_[256]{};  // Zero-initialized
+    alignas(64) uint64_t      last_sequence_[256]{};  // Zero-initialized
     BridgeStats               stats_;
 };
 
@@ -299,9 +401,16 @@ struct HornetSystem {
             FilterMode         filter     = FilterMode::STRICT) noexcept {
 
         if (!umem.initialize()) return false;
-        if (!hornet.initialize(iface, queue_id, umem, mode, busy_poll)) return false;
+        if (!hornet.initialize(iface, queue_id, umem, mode, busy_poll)) {
+            umem.shutdown();
+            return false;
+        }
         if (!bpf_obj_path.empty()) {
-            if (!hornet.load_bpf_program(bpf_obj_path, filter)) return false;
+            if (!hornet.load_bpf_program(bpf_obj_path, filter)) {
+                hornet.shutdown();
+                umem.shutdown();
+                return false;
+            }
         }
         hornet.set_rx_callback(bridge.as_rx_callback());
         return true;

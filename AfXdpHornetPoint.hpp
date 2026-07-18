@@ -38,10 +38,23 @@
 #include "hornet_config.hpp"
 #include "umem_numa_allocator.hpp"
 
-// libbpf / libxdp headers
+// libbpf's AF_XDP compatibility header still spells GNU __typeof__ as
+// `typeof` on some supported distributions. Keep the project in strict C++23
+// mode and scope the compatibility macro to that system header only.
+#if defined(__cplusplus) && !defined(typeof)
+#  define HORNET_RESTORE_TYPEOF_MACRO 1
+#  define typeof __typeof__
+#endif
+
+// libbpf / AF_XDP headers
 #include <bpf/libbpf.h>
 #include <bpf/xsk.h>           // xsk_socket, xsk_umem, xsk_ring_prod/cons
 #include <linux/if_xdp.h>
+
+#if defined(HORNET_RESTORE_TYPEOF_MACRO)
+#  undef typeof
+#  undef HORNET_RESTORE_TYPEOF_MACRO
+#endif
 
 // Linux
 #include <linux/if_link.h>
@@ -167,6 +180,7 @@ private:
     struct bpf_object*          bpf_obj_    = nullptr;
     int                         prog_fd_    = -1;
     uint32_t                    xdp_flags_  = 0;
+    uint32_t                    attached_prog_id_ = 0;
 
     // ── Hot path state ────────────────────────────────────────────────────────
     std::atomic<bool>           running_{false};
